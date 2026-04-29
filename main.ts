@@ -1,162 +1,93 @@
-const TARGET_BASE = (Deno.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
+const TARGET_BASE = (Deno.env.get("TARGET") || Deno.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
 
-const HOP_BY_HOP_HEADERS = new Set([
-  "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
-  "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
-  "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
-  "x-real-ip",
+const STRIP_HEADERS = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
+  "x-vercel-id",
+  "x-deno-id", // platform specific
 ]);
 
 Deno.serve(async (req: Request): Promise<Response> => {
+  const url = new URL(req.url);
+  const pathname = url.pathname + url.search;
+  
+  console.log(`[${new Date().toISOString()}] ${req.method} ${pathname} -> ${TARGET_BASE || "(no target)"}`);
+
   if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN env var is required (e.g. https://xray.example.com:8443)", { 
-      status: 500, 
-      headers: { "content-type": "text/plain" } 
+    return new Response("Misconfigured: Set TARGET env var (e.g. https://xray.nickgur.online:8443)", { 
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
   }
 
-  // Optional: Handle preflight (rarely needed for XHTTP clients but harmless)
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Max-Age": "86400",
-      },
-    });
+  const targetUrl = TARGET_BASE + pathname;
+
+  const headers = new Headers();
+  let clientIp = req.headers.get("x-real-ip") || req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "";
+
+  for (const [key, value] of req.headers.entries()) {
+    const k = key.toLowerCase();
+    if (STRIP_HEADERS.has(k) || k.startsWith("x-deno-") || k.startsWith("x-vercel-") || k.startsWith("cf-")) continue;
+    if (k === "x-real-ip" || k === "x-forwarded-for") continue;
+    headers.set(key, value);
+  }
+
+  if (clientIp) headers.set("x-forwarded-for", clientIp);
+
+  // Important: Backend usually expects its own hostname in the Host header
+  try {
+    const backendHost = new URL(TARGET_BASE).host;
+    headers.set("host", backendHost);
+  } catch (e) {
+    console.error("Invalid TARGET URL format");
+  }
+
+  const method = req.method;
+  const hasBody = !["GET", "HEAD", "OPTIONS"].includes(method);
+
+  const fetchOptions: RequestInit = {
+    method,
+    headers,
+    redirect: "manual",
+  };
+
+  if (hasBody && req.body) {
+    fetchOptions.body = req.body;
+    // @ts-ignore - Duplex is supported in recent runtimes for streaming
+    (fetchOptions as any).duplex = "half";
   }
 
   try {
-    const url = new URL(req.url);
-    const targetUrl = new URL(url.pathname + url.search, TARGET_BASE).toString();
-
-    const headers = new Headers();
-    let clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip");
-
-    for (const [key, value] of req.headers) {
-      const k = key.toLowerCase();
-      if (HOP_BY_HOP_HEADERS.has(k) || k.startsWith("x-deno-") || k.startsWith("cf-") || k.startsWith("x-vercel-")) {
-        continue;
-      }
-      if (k === "x-real-ip" || k === "x-forwarded-for") continue;
-      headers.set(key, value);
-    }
-    if (clientIp) headers.set("x-forwarded-for", clientIp);
-
-    // Let fetch set correct Host based on TARGET_BASE (or explicitly set if your backend requires a specific one)
-    // headers.set("host", new URL(TARGET_BASE).host); // Uncomment only if needed
-
-    const hasBody = !["GET", "HEAD"].includes(req.method);
-    const fetchOpts: RequestInit & { duplex?: "half" } = {
-      method: req.method,
-      headers,
-      redirect: "manual",
-    };
-
-    if (hasBody && req.body) {
-      fetchOpts.body = req.body;
-      fetchOpts.duplex = "half"; // Critical for bidirectional streaming (upload while receiving response)
-    }
-
-    const upstream = await fetch(targetUrl, fetchOpts);
-
-    const responseHeaders = new Headers(upstream.headers);
-    // Strip only true hop-by-hop headers. Do NOT blindly delete transfer-encoding/content-length
-    // (this was likely breaking your download streaming).
-    for (const key of HOP_BY_HOP_HEADERS) {
-      responseHeaders.delete(key);
-    }
-
-    // Optional: Make it look more like a normal site on root path
-    if (url.pathname === "/" || url.pathname === "") {
-      return new Response("OK - XHTTP Relay Active (Deno Deploy)", {
-        status: 200,
-        headers: { "content-type": "text/plain" },
-      });
-    }
-
-    return new Response(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: responseHeaders,
-    });
-  } catch (error) {
-    console.error("XHTTP Relay Error:", error);
-    return new Response(`Bad Gateway: ${(error as Error).message}`, { 
-      status: 502,
-      headers: { "content-type": "text/plain" } 
-    });
-  }
-});      if (k === "x-real-ip" || k === "x-forwarded-for") {
-        clientIp = value;
-        continue;
-      }
-      headers.set(k, value);
-    }
-    if (clientIp) headers.set("x-forwarded-for", clientIp);
-
-    const isBodyless = req.method === "GET" || req.method === "HEAD";
-    const fetchOptions: RequestInit = {
-      method: req.method,
-      headers,
-      redirect: "manual",
-      duplex: isBodyless ? undefined : "half",
-    };
-
-    if (!isBodyless) {
-      fetchOptions.body = req.body;
-    }
-
     const upstream = await fetch(targetUrl, fetchOptions);
 
     const responseHeaders = new Headers(upstream.headers);
-    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    for (const k of STRIP_HEADERS) {
+      responseHeaders.delete(k);
+    }
     responseHeaders.delete("transfer-encoding");
+    responseHeaders.delete("content-length"); // Let Deno/streaming handle sizing where possible
 
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: responseHeaders,
     });
-  } catch (error) {
-    console.error("Relay error:", error);
-    return new Response("Bad Gateway", { status: 502 });
-  }
-});      headers.set(k, value);
-    }
-    if (clientIp) headers.set("x-forwarded-for", clientIp);
-
-    const method = request.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
-
-    const fetchOptions: RequestInit = {
-      method,
-      headers,
-      redirect: "manual",
-    };
-
-    if (hasBody) {
-      fetchOptions.body = request.body;
-    }
-
-    const upstream = await fetch(targetUrl, fetchOptions);
-
-    const responseHeaders = new Headers();
-    for (const [key, value] of upstream.headers) {
-      const k = key.toLowerCase();
-      if (k === "transfer-encoding") continue;
-      responseHeaders.set(key, value);
-    }
-
-    return new Response(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: responseHeaders,
+  } catch (err) {
+    console.error("Relay error:", err);
+    return new Response("Bad Gateway: Tunnel Failed", { 
+      status: 502,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
-  } catch (error) {
-    console.error("Relay error:", error);
-    return new Response("Bad Gateway: Relay Failed", { status: 502 });
   }
 });
