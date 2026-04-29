@@ -1,8 +1,12 @@
 {
   "tasks": {
-    "dev": "deno run --allow-net --allow-env main.ts"
+    "dev": "deno run --allow-net --allow-env index.ts",
+    "start": "deno run --allow-net --allow-env index.ts"
+  },
+  "deploy": {
+    "entrypoint": "index.ts"
   },
   "compilerOptions": {
-    "lib": ["deno.unstable"]
+    "lib": ["deno.window"]
   }
 }
