@@ -1,17 +1,21 @@
 const TARGET_BASE = (Deno.env.get("TARGET_DOMAIN") || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
-  "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-  "te", "trailer", "transfer-encoding", "upgrade", "forwarded",
-  "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+  "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
+  "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+  "x-real-ip",
 ]);
 
 Deno.serve(async (req: Request): Promise<Response> => {
   if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN env var is required", { status: 500 });
+    return new Response("Misconfigured: TARGET_DOMAIN env var is required (e.g. https://xray.example.com:8443)", { 
+      status: 500, 
+      headers: { "content-type": "text/plain" } 
+    });
   }
 
-  // Handle CORS preflight
+  // Optional: Handle preflight (rarely needed for XHTTP clients but harmless)
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -19,6 +23,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400",
       },
     });
   }
@@ -28,13 +33,63 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const targetUrl = new URL(url.pathname + url.search, TARGET_BASE).toString();
 
     const headers = new Headers();
-    let clientIp: string | null = null;
+    let clientIp = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip");
 
     for (const [key, value] of req.headers) {
       const k = key.toLowerCase();
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-deno-") || k.startsWith("cf-")) continue;
-      if (k === "x-real-ip" || k === "x-forwarded-for") {
+      if (HOP_BY_HOP_HEADERS.has(k) || k.startsWith("x-deno-") || k.startsWith("cf-") || k.startsWith("x-vercel-")) {
+        continue;
+      }
+      if (k === "x-real-ip" || k === "x-forwarded-for") continue;
+      headers.set(key, value);
+    }
+    if (clientIp) headers.set("x-forwarded-for", clientIp);
+
+    // Let fetch set correct Host based on TARGET_BASE (or explicitly set if your backend requires a specific one)
+    // headers.set("host", new URL(TARGET_BASE).host); // Uncomment only if needed
+
+    const hasBody = !["GET", "HEAD"].includes(req.method);
+    const fetchOpts: RequestInit & { duplex?: "half" } = {
+      method: req.method,
+      headers,
+      redirect: "manual",
+    };
+
+    if (hasBody && req.body) {
+      fetchOpts.body = req.body;
+      fetchOpts.duplex = "half"; // Critical for bidirectional streaming (upload while receiving response)
+    }
+
+    const upstream = await fetch(targetUrl, fetchOpts);
+
+    const responseHeaders = new Headers(upstream.headers);
+    // Strip only true hop-by-hop headers. Do NOT blindly delete transfer-encoding/content-length
+    // (this was likely breaking your download streaming).
+    for (const key of HOP_BY_HOP_HEADERS) {
+      responseHeaders.delete(key);
+    }
+
+    // Optional: Make it look more like a normal site on root path
+    if (url.pathname === "/" || url.pathname === "") {
+      return new Response("OK - XHTTP Relay Active (Deno Deploy)", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: responseHeaders,
+    });
+  } catch (error) {
+    console.error("XHTTP Relay Error:", error);
+    return new Response(`Bad Gateway: ${(error as Error).message}`, { 
+      status: 502,
+      headers: { "content-type": "text/plain" } 
+    });
+  }
+});      if (k === "x-real-ip" || k === "x-forwarded-for") {
         clientIp = value;
         continue;
       }
