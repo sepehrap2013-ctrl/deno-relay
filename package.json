@@ -1,0 +1,11 @@
+{
+  "name": "relay",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node --experimental-fetch server.js",
+    "build": "npx tsc server.ts --target ES2022 --module commonjs --esModuleInterop"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
